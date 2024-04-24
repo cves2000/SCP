@@ -85,10 +85,12 @@ class EHEM(pl.LightningModule):  # 定义一个类EHEM，继承自PyTorch Lightn
         return torch.concat(states[::-1], 2)  # 将states反转后进行连接，并返回
 
 
+    # 定义前向传播函数
     def forward(self, data, pos, enc=True):
         '''
         data: bsz, context size, ancients + current node (4), level + octant + occ (3)
         '''
+        # 如果数据的形状为奇数，则进行填充
         padded = False
         if data.shape[1] % 2 == 1:
             padded = True
@@ -97,48 +99,69 @@ class EHEM(pl.LightningModule):  # 定义一个类EHEM，继承自PyTorch Lightn
             data = torch.cat((data, pad), dim=1)
             pos_pad = torch.zeros_like(pos[:, :, :1])
             pos = torch.cat((pos, pos_pad), dim=2)
-
+    
         bsz = data.shape[0]
         csz = data.shape[1]
-
+    
+        # 获取前一个占用状态
         pre_occ = data[:, ::2, -1, -1]
+        # 重塑数据
         data = data.reshape(bsz, csz, -1)[:, :, :-1] # bsz, csz, 11. 11: 4*(level, oct, occ), except occ of current voxel
-
+    
+        # 生成特征
         feat = self.geo_feat_generator(data, pos)
+        # 自我注意力变换
         self_output = self.swin_self_transformer(feat, csz, output_hidden_states=True, output_hidden_states_before_downsampling=True)
-
+    
+        # 连接隐藏状态
         self_output = self.concat_states(self_output.hidden_states)
+        # 生成祖先特征
         feat_a = self.ancient_mlp(self_output)
-
+    
+        # 分割特征
         feat_a1 = feat_a[:, ::2]
         feat_a2 = feat_a[:, 1::2]
+        # 预测概率1
         prob1 = self.prob_pred_mlp1(feat_a1)
-
+    
+        # 嵌入前一个占用状态
         pre_occ_embed = self.geo_feat_generator.embed_occ(pre_occ)
+        # 生成前一个占用特征
         pre_occ_feat = self.pre_occ_mlp(pre_occ_embed)
+        # 生成前一个注意力特征
         pre_attn_feat = self.pre_attn_mlp(feat_a1)
-
+    
+        # 连接前一个特征
         pre_feat = torch.concat((pre_occ_feat, pre_attn_feat), dim=2)
+        # 交叉注意力变换
         cross_output = self.swin_cross_transformer(pre_feat, feat_a2.shape[1], query=feat_a2, output_hidden_states=True, output_hidden_states_before_downsampling=True)
+        # 连接交叉输出的隐藏状态
         cross_output = self.concat_states(cross_output.hidden_states)
+        # 连接特征
         feat_a2 = torch.concat((cross_output, feat_a2), 2)
+        # 预测概率2
         prob2 = self.prob_pred_mlp2(feat_a2)
-
+    
+        # 如果进行了填充，删除最后一个预测
         if padded:
             prob2 = prob2[:, :-1]
-
+    
+        # 如果在训练，返回所有预测
         if self.training:
             probs = torch.zeros((prob1.shape[0], prob1.shape[1] + prob2.shape[1], prob1.shape[2])).to(prob1.device)
             probs[:, ::2] = prob1
             probs[:, 1::2] = prob2
             return probs
+        # 如果在编码，返回预测1和预测2
         elif enc:
             return prob1, prob2
-
+    
+    # 定义解码函数
     def decode(self, data, pos, pre_occ=None):
         '''
         data: bsz, context size, ancients + current node (4), level + octant + occ (3)
         '''
+        # 如果数据的形状为奇数，则进行填充
         padded = False
         if data.shape[1] % 2 == 1:
             padded = True
@@ -147,76 +170,98 @@ class EHEM(pl.LightningModule):  # 定义一个类EHEM，继承自PyTorch Lightn
             data = torch.cat((data, pad), dim=1)
             pos_pad = torch.zeros_like(pos[:, :, :1])
             pos = torch.cat((pos, pos_pad), dim=2)
-
+    
         bsz = data.shape[0]
         csz = data.shape[1]
-
+    
+        # 如果没有前一个占用状态
         if pre_occ is None:
+            # 重塑数据
             data = data.reshape(bsz, csz, -1)[:, :, :-1] # bsz, csz, 11. 11: 4*(level, oct, occ), except occ of current voxel
-
+    
+            # 生成特征
             feat = self.geo_feat_generator(data, pos)
+            # 自我注意力变换
             self_output = self.swin_self_transformer(feat, csz, output_hidden_states=True, output_hidden_states_before_downsampling=True)
+            # 连接隐藏状态
             self_output = self.concat_states(self_output.hidden_states)
+            # 生成祖先特征
             feat_a = self.ancient_mlp(self_output)
-
+    
+            # 分割特征
             self.feat_a1 = feat_a[:, ::2]
             self.feat_a2 = feat_a[:, 1::2]
+            # 预测概率1
             prob1 = self.prob_pred_mlp1(self.feat_a1)
             return prob1
-
+    
+        # 嵌入前一个占用状态
         pre_occ_embed = self.geo_feat_generator.embed_occ(pre_occ)
+        # 生成前一个占用特征
         pre_occ_feat = self.pre_occ_mlp(pre_occ_embed)
+        # 生成前一个注意力特征
         pre_attn_feat = self.pre_attn_mlp(self.feat_a1)
-
+    
+        # 连接前一个特征
         pre_feat = torch.concat((pre_occ_feat, pre_attn_feat), dim=2)
+        # 交叉注意力变换
         cross_output = self.swin_cross_transformer(pre_feat, csz//2, query=self.feat_a2, output_hidden_states=True, output_hidden_states_before_downsampling=True)
+        # 连接交叉输出的隐藏状态
         cross_output = self.concat_states(cross_output.hidden_states)
+        # 连接特征
         feat_a2 = torch.concat((cross_output, self.feat_a2), 2)
+        # 预测概率2
         prob2 = self.prob_pred_mlp2(feat_a2)
-
+    
+        # 如果进行了填充，删除最后一个预测
         if padded:
             prob2 = prob2[:, :-1]
-
+    
         return prob2
 
+
+    # 定义函数，配置优化器
     def configure_optimizers(self):
-        optim_cfg = self.cfg.train.optimizer
-        sched_cfg = self.cfg.train.lr_scheduler
-        if optim_cfg.name == "Adam":
-            optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.train.lr)
+        optim_cfg = self.cfg.train.optimizer  # 获取优化器配置
+        sched_cfg = self.cfg.train.lr_scheduler  # 获取学习率调度器配置
+        if optim_cfg.name == "Adam":  # 如果优化器是Adam
+            optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.train.lr)  # 创建Adam优化器
         else:
-            raise NotImplementedError()
-        if sched_cfg.name == "StepLR":
+            raise NotImplementedError()  # 其他优化器暂未实现
+        if sched_cfg.name == "StepLR":  # 如果学习率调度器是StepLR
             lr_scheduler = torch.optim.lr_scheduler.StepLR(
                 optimizer, step_size=sched_cfg.step_size, gamma=sched_cfg.gamma
-            )
+            )  # 创建StepLR学习率调度器
         else:
-            raise NotImplementedError()
-
-        return {"optimizer": optimizer, "lr_scheduler": lr_scheduler}
-
+            raise NotImplementedError()  # 其他学习率调度器暂未实现
+    
+        return {"optimizer": optimizer, "lr_scheduler": lr_scheduler}  # 返回优化器和学习率调度器
+    
+    # 定义函数，训练步骤
     def training_step(self, batch):
-        data, pos, labels = batch
-        if self.cfg.data.vari_data_len and torch.rand(1) < 0.3:
-            sz = torch.randint(1, 8192, (1,))
-            data = data[:, :sz]
-            pos = pos[:, :, :sz]
-            labels = labels[:, :sz]
-        pred = self(data, pos)
+        data, pos, labels = batch  # 获取数据，位置和标签
+        if self.cfg.data.vari_data_len and torch.rand(1) < 0.3:  # 如果数据长度可变并且随机数小于0.3
+            sz = torch.randint(1, 8192, (1,))  # 随机生成一个1到8192的整数
+            data = data[:, :sz]  # 截取数据
+            pos = pos[:, :, :sz]  # 截取位置
+            labels = labels[:, :sz]  # 截取标签
+        pred = self(data, pos)  # 使用模型预测
         loss = self.criterion(
             pred.view(-1, self.cfg.model.token_num), labels.reshape(-1)
-        ) / math.log(2)
-        self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=True)
-        return loss
-
+        ) / math.log(2)  # 计算损失
+        self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=True)  # 记录训练损失
+        return loss  # 返回损失
+    
+    # 定义函数，加载预训练模型
     def load_pretrain(self, path, strict=True):
         '''
         load EHEM pretrained model
         '''
-        sd = torch.load(path)['state_dict']
-        ref_sd = self.state_dict()
-        keys = list(sd.keys())
-        for k in keys:
-            if k not in ref_sd or ref_sd[k].shape != sd[k].shape:
-                sd.pop(k)
-        return self.load_state_dict(sd, strict)
+        sd = torch.load(path)['state_dict']  # 加载预训练模型的状态字典
+        ref_sd = self.state_dict()  # 获取当前模型的状态字典
+        keys = list(sd.keys())  # 获取预训练模型状态字典的键列表
+        for k in keys:  # 遍历键列表
+            if k not in ref_sd or ref_sd[k].shape != sd[k].shape:  # 如果键不在当前模型的状态字典中，或者形状不匹配
+                sd.pop(k)  # 从预训练模型的状态字典中删除该键
+        return self.load_state_dict(sd, strict)  # 加载预训练模型的状态字典
+
